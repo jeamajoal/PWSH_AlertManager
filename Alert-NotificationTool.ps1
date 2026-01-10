@@ -166,7 +166,8 @@ SubjectPrefixFormat=[{ScriptId}]
 DefaultEmailProfile=default
 
 [Email]
-Provider=
+# Provider MUST be set to 'mailkit' (the only supported provider)
+Provider=mailkit
 FromAddress=
 FromName=
 
@@ -194,6 +195,7 @@ CredentialXmlPath=
 TimeoutSeconds=60
 
 [MailKit]
+# REQUIRED: MailKit is the only supported email provider
 MimeKitDllPath=
 MailKitDllPath=
 
@@ -333,7 +335,7 @@ function New-DefaultNotificationToolConfig {
 		DefaultEmailProfile = 'default'
 		EmailProfiles = @{}
 		Email = [pscustomobject]@{
-			Provider = '' # 'mailkit' or '' (no built-in provider)
+			Provider = 'mailkit' # REQUIRED: 'mailkit' is the only supported provider
 			FromAddress = ''
 			FromName = ''
 			Smtp = [pscustomobject]@{
@@ -1251,7 +1253,7 @@ function Send-NotifierEmail {
 		}
 	}
 
-	throw 'No EmailSender provided and Email.Provider is not set to mailkit. Configure Config\config.conf (Email.Provider=mailkit + SMTP + MailKit DLL paths), or pass -EmailSender to Start-AlertNotificationCycle.'
+	throw 'No EmailSender provided and Email.Provider is not set to mailkit. MailKit is REQUIRED - configure Config\config.conf (Email.Provider=mailkit + SMTP + MailKit DLL paths), or pass -EmailSender to Start-AlertNotificationCycle.'
 }
 
 function Resolve-NotificationToolAttachmentPath {
