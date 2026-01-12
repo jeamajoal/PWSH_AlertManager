@@ -30,7 +30,7 @@ With this, you can get behavior like:
 
 - Windows PowerShell 5.1 or PowerShell 7+
 - Ability to send email via SMTP
-- Optional: **MailKit + MimeKit** DLLs if you use the `mailkit` provider
+- **REQUIRED: MailKit + MimeKit** DLLs (MailKit is the only supported email provider)
 
 ## Quick start
 
@@ -71,7 +71,7 @@ Top-level:
 - `DefaultEmailProfile` – profile name (default `default`)
 
 Core email:
-- `[Email] Provider` – set to `mailkit` to use MailKit, or leave blank for legacy/no-provider behavior
+- `[Email] Provider` – **MUST** be set to `mailkit` (MailKit is the only supported provider)
 - `[Email] FromAddress`, `[Email] FromName`
 
 SMTP:
@@ -83,9 +83,9 @@ SMTP:
   - `credentialXml` – load PSCredential from `CredentialXmlPath`
 - `[Smtp] TimeoutSeconds`
 
-MailKit (only if `Provider=mailkit`):
-- `[MailKit] MimeKitDllPath`
-- `[MailKit] MailKitDllPath`
+MailKit (required):
+- `[MailKit] MimeKitDllPath` – path to MimeKit.dll
+- `[MailKit] MailKitDllPath` – path to MailKit.dll
 
 ### Using `PasswordEnvVar` (recommended)
 
