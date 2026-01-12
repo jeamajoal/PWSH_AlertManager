@@ -171,4 +171,4 @@ Issues and PRs are welcome. When contributing changes:
 
 ## License
 
-Add your license here (MIT/Apache-2.0/etc.).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
