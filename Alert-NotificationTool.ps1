@@ -159,6 +159,31 @@ function New-DefaultNotificationToolConfigConfText {
 # - Use comma-separated lists where applicable (example: DefaultRecipients=a@b.com,b@c.com).
 # - Consider using PasswordEnvVar instead of Password for Task Scheduler.
 
+# Escalation (optional)
+#
+# These settings provide DEFAULTS used when auto-creating a per-script Escalation.json.
+# Per-script escalation is configured in: NotificationTool\Registrations\<ScriptId>\Escalation.json
+
+# EscalationSubjectPrefixFormat:
+# - Prefix used for escalation email subjects.
+# - Supports {ScriptId}
+EscalationSubjectPrefixFormat=[{ScriptId}][ESCALATION]
+
+# DefaultEscalationEmailProfile:
+# - Optional email profile (from this config) to use for escalation emails.
+# - If blank, the script's normal EmailProfile (Registration.json) will be used.
+DefaultEscalationEmailProfile=
+
+# DefaultEscalationTierEmails.<N>:
+# - Tiered escalation recipients keyed by alert SentCount threshold N.
+# - Thresholds are driven ONLY by these keys.
+# - Comma-separated list.
+# Example:
+#   DefaultEscalationTierEmails.3=oncall@example.com
+#   DefaultEscalationTierEmails.5=teamlead@example.com
+#   DefaultEscalationTierEmails.7=director@example.com
+DefaultEscalationTierEmails.=
+
 DefaultRecipients=
 SubjectPrefixFormat=[{ScriptId}]
 
@@ -166,8 +191,7 @@ SubjectPrefixFormat=[{ScriptId}]
 DefaultEmailProfile=default
 
 [Email]
-# Provider MUST be set to 'mailkit' (the only supported provider)
-Provider=mailkit
+Provider=
 FromAddress=
 FromName=
 
@@ -195,7 +219,6 @@ CredentialXmlPath=
 TimeoutSeconds=60
 
 [MailKit]
-# REQUIRED: MailKit is the only supported email provider
 MimeKitDllPath=
 MailKitDllPath=
 
@@ -332,10 +355,13 @@ function New-DefaultNotificationToolConfig {
 		Version = 3
 		DefaultRecipients = @()
 		SubjectPrefixFormat = '[{ScriptId}]'
+		EscalationSubjectPrefixFormat = '[{ScriptId}][ESCALATION]'
+		DefaultEscalationEmailProfile = ''
+		DefaultEscalationTierEmails = @{}
 		DefaultEmailProfile = 'default'
 		EmailProfiles = @{}
 		Email = [pscustomobject]@{
-			Provider = 'mailkit' # REQUIRED: 'mailkit' is the only supported provider
+			Provider = '' # 'mailkit' or '' (no built-in provider)
 			FromAddress = ''
 			FromName = ''
 			Smtp = [pscustomobject]@{
@@ -372,6 +398,16 @@ function Get-NotificationToolConfig {
 				$config = $default
 				$config.DefaultRecipients = Split-ConfCsv $conf['DefaultRecipients']
 				if ($conf.ContainsKey('SubjectPrefixFormat')) { $config.SubjectPrefixFormat = $conf['SubjectPrefixFormat'] }
+				if ($conf.ContainsKey('EscalationSubjectPrefixFormat')) { $config.EscalationSubjectPrefixFormat = $conf['EscalationSubjectPrefixFormat'] }
+				if ($conf.ContainsKey('DefaultEscalationEmailProfile')) { $config.DefaultEscalationEmailProfile = $conf['DefaultEscalationEmailProfile'] }
+				# DefaultEscalationTierEmails.<N>=a@b.com,c@d.com
+				$config.DefaultEscalationTierEmails = @{}
+				foreach ($k in @($conf.Keys)) {
+					if ($k -match '^DefaultEscalationTierEmails\.(\d+)$') {
+						$n = $Matches[1]
+						$config.DefaultEscalationTierEmails[$n] = Split-ConfCsv $conf[$k]
+					}
+				}
 				if ($conf.ContainsKey('DefaultEmailProfile')) { $config.DefaultEmailProfile = $conf['DefaultEmailProfile'] }
 
 				if ($conf.ContainsKey('Email.Provider')) { $config.Email.Provider = $conf['Email.Provider'] }
@@ -486,6 +522,12 @@ function Get-NotificationToolConfig {
 	if ($null -eq $config.DefaultRecipients) {
 		$config.DefaultRecipients = @()
 	}
+	if (-not $config.EscalationSubjectPrefixFormat) {
+		$config.EscalationSubjectPrefixFormat = '[{ScriptId}][ESCALATION]'
+	}
+	if (-not $config.DefaultEscalationTierEmails) {
+		$config.DefaultEscalationTierEmails = @{}
+	}
 	if (-not $config.SubjectPrefixFormat) {
 		$config.SubjectPrefixFormat = '[{ScriptId}]'
 	}
@@ -595,8 +637,10 @@ function Send-EmailMailKit {
 		[Parameter(Mandatory = $true)][object]$Config,
 		[object]$EmailConfig,
 		[Parameter(Mandatory = $true)][string[]]$Recipients,
+		[string[]]$CcRecipients,
 		[Parameter(Mandatory = $true)][string]$Subject,
 		[Parameter(Mandatory = $true)][string]$Body,
+		[string]$BodyHtml,
 		[string]$Attachment
 	)
 
@@ -630,11 +674,21 @@ function Send-EmailMailKit {
 		}
 	}
 
+	foreach ($r in @($CcRecipients)) {
+		if (-not [string]::IsNullOrWhiteSpace($r)) {
+			$msg.Cc.Add([MimeKit.MailboxAddress]::new($r.Trim(), $r.Trim()))
+		}
+	}
+
 	$msg.Subject = $Subject
 
 	$builder = [MimeKit.BodyBuilder]::new()
-	# Keep it simple: treat body as plain text.
+	# Always set a plain text body for compatibility.
 	$builder.TextBody = $Body
+	# Optional HTML body (MailKit will send a multipart/alternative).
+	if (-not [string]::IsNullOrWhiteSpace($BodyHtml)) {
+		$builder.HtmlBody = $BodyHtml
+	}
 	if ($Attachment -and (Test-Path -LiteralPath $Attachment)) {
 		$null = $builder.Attachments.Add($Attachment)
 	}
@@ -923,6 +977,113 @@ function Get-AlertNotificationPolicy {
 	return $policy
 }
 
+function New-DefaultEscalationPolicy {
+	param(
+		[Parameter(Mandatory = $true)][string]$ScriptId,
+		[Parameter(Mandatory = $true)][object]$Config
+	)
+
+	$tierEmails = @{}
+	try { if ($Config.DefaultEscalationTierEmails) { $tierEmails = $Config.DefaultEscalationTierEmails } } catch { $tierEmails = @{} }
+	if (-not $tierEmails -or $tierEmails.Keys.Count -eq 0) {
+		# Provide a safe, obvious placeholder so new repo consumers see the intended shape.
+		$tierEmails = @{ '3' = @('tier3@example.com') }
+	}
+
+	$subjPrefix = '[{ScriptId}][ESCALATION]'
+	try { if ($Config.EscalationSubjectPrefixFormat) { $subjPrefix = $Config.EscalationSubjectPrefixFormat } } catch { }
+	$subjPrefix = $subjPrefix -replace '\{ScriptId\}', $ScriptId
+
+	[pscustomobject]@{
+		Version = 3
+		Enabled = $false
+		EmailProfile = ''
+		SubjectPrefix = $subjPrefix
+		EscalationTierEmails = $tierEmails
+		EscalationTierNotes = @{}
+		Notes = @(
+			'Escalation.json controls tiered escalation for this script registration.',
+			'Enabled: set true to allow escalation emails.',
+			'EmailProfile: optional profile name from Config/config.conf; blank uses Registration.json EmailProfile.',
+			'SubjectPrefix: prepended to escalation email subjects.',
+			'EscalationTierEmails: REQUIRED. Map of threshold -> array of emails to notify at that tier (keys are strings, like "3").',
+			'EscalationTierNotes: OPTIONAL. Map of threshold -> note text to include in the escalation email for that tier.',
+			'Thresholds are driven ONLY by EscalationTierEmails keys (no other tolerance settings).',
+			'When escalating, previously notified recipients are placed in Cc and only NEW recipients are placed in To.'
+		)
+	}
+}
+
+function Get-AlertEscalationPolicy {
+	param(
+		[Parameter(Mandatory = $true)][string]$EscalationPolicyPath,
+		[Parameter(Mandatory = $true)][string]$ScriptId
+	)
+
+	$cfg = Get-NotificationToolConfig
+	$default = New-DefaultEscalationPolicy -ScriptId $ScriptId -Config $cfg
+	$pol = Read-JsonFile -Path $EscalationPolicyPath -Default $default
+
+	$changed = $false
+	try {
+		# Upgrade/normalize older Escalation.json files by adding any newly introduced properties.
+		foreach ($p in @($default.PSObject.Properties)) {
+			if ($pol.PSObject.Properties.Match($p.Name).Count -eq 0) {
+				$pol | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force
+				$changed = $true
+			}
+		}
+	}
+	catch { }
+
+	# Remove legacy properties (tier-only escalation).
+	foreach ($legacy in @('Recipients', 'EscalateIf', 'NotificationCountTolerance', 'EscalateAgain')) {
+		try {
+			if ($pol.PSObject.Properties.Match($legacy).Count -gt 0) {
+				[void]$pol.PSObject.Properties.Remove($legacy)
+				$changed = $true
+			}
+		}
+		catch { }
+	}
+
+	# Normalize commonly-edited fields to expected types.
+	try {
+		if (-not $pol.EscalationTierEmails) { $pol.EscalationTierEmails = @{}; $changed = $true }
+		elseif (-not ($pol.EscalationTierEmails -is [hashtable])) {
+			# Convert PSCustomObject map to hashtable for easier editing/lookup.
+			$ht = @{}
+			foreach ($prop in @($pol.EscalationTierEmails.PSObject.Properties)) {
+				$ht[$prop.Name] = $prop.Value
+			}
+			$pol.EscalationTierEmails = $ht
+			$changed = $true
+		}
+	}
+	catch { }
+	try {
+		if (-not $pol.EscalationTierNotes) { $pol.EscalationTierNotes = @{}; $changed = $true }
+		elseif (-not ($pol.EscalationTierNotes -is [hashtable])) {
+			$ht2 = @{}
+			foreach ($prop in @($pol.EscalationTierNotes.PSObject.Properties)) {
+				$ht2[$prop.Name] = $prop.Value
+			}
+			$pol.EscalationTierNotes = $ht2
+			$changed = $true
+		}
+	}
+	catch { }
+
+	if (-not (Test-Path -LiteralPath $EscalationPolicyPath)) {
+		Write-JsonFileAtomic -Path $EscalationPolicyPath -Object $pol
+	}
+	elseif ($changed) {
+		# Persist upgrades so users can edit the new fields directly.
+		Write-JsonFileAtomic -Path $EscalationPolicyPath -Object $pol
+	}
+	return $pol
+}
+
 function Get-AlertNotificationState {
 	param([Parameter(Mandatory = $true)][string]$StatePath)
 	$default = New-DefaultAlertState
@@ -962,6 +1123,7 @@ function Get-OrCreateRegistration {
 	$policyPath = Join-Path $folder 'Policy.json'
 	$statePath = Join-Path $folder 'State.json'
 	$flagPath = Join-Path $folder 'ALERT_ACTIVE.flag'
+	$escalationPolicyPath = Join-Path $folder 'Escalation.json'
 
 	$defaultRecipients = @($cfg.DefaultRecipients)
 	$subjectPrefix = $cfg.SubjectPrefixFormat -replace '\{ScriptId\}', $scriptId
@@ -972,6 +1134,7 @@ function Get-OrCreateRegistration {
 		ScriptPath = $ScriptPath
 		EmailProfile = $cfg.DefaultEmailProfile
 		Recipients = @($defaultRecipients)
+		EscalationPolicyPath = $escalationPolicyPath
 		SubjectPrefix = $subjectPrefix
 		PolicyPath = $policyPath
 		StatePath = $statePath
@@ -989,10 +1152,17 @@ function Get-OrCreateRegistration {
 	if (-not $reg.AlertFlagPath) { $reg | Add-Member -NotePropertyName AlertFlagPath -NotePropertyValue $flagPath -Force }
 	if (-not $reg.SubjectPrefix) { $reg | Add-Member -NotePropertyName SubjectPrefix -NotePropertyValue $subjectPrefix -Force }
 	if ($null -eq $reg.Recipients) { $reg | Add-Member -NotePropertyName Recipients -NotePropertyValue @($defaultRecipients) -Force }
+	if (-not $reg.EscalationPolicyPath) { $reg | Add-Member -NotePropertyName EscalationPolicyPath -NotePropertyValue $escalationPolicyPath -Force }
 
 	if (-not (Test-Path -LiteralPath $registrationPath)) {
 		Write-JsonFileAtomic -Path $registrationPath -Object $reg
 	}
+
+	# Ensure escalation policy exists.
+	try {
+		$null = Get-AlertEscalationPolicy -EscalationPolicyPath $reg.EscalationPolicyPath -ScriptId $reg.ScriptId
+	}
+	catch { }
 
 	return $reg
 }
@@ -1217,6 +1387,7 @@ function Send-NotifierEmail {
 		[Parameter(Mandatory = $true)][object]$Notifier,
 		[Parameter(Mandatory = $true)][string]$Subject,
 		[Parameter(Mandatory = $true)][string]$Body,
+		[string]$BodyHtml,
 		[string]$Attachment
 	)
 
@@ -1227,6 +1398,7 @@ function Send-NotifierEmail {
 
 	$emailSender = $Notifier.EmailSender
 	if ($emailSender) {
+		# Custom sender contract is text-body only.
 		& $emailSender $recipients $Subject $Body $Attachment
 		return
 	}
@@ -1248,12 +1420,471 @@ function Send-NotifierEmail {
 		catch { }
 
 		if ($emailCfg -and $emailCfg.Provider -and ($emailCfg.Provider.ToString().ToLowerInvariant() -eq 'mailkit')) {
-			Send-EmailMailKit -Config $cfg -EmailConfig $emailCfg -Recipients $recipients -Subject $Subject -Body $Body -Attachment $Attachment
+			Send-EmailMailKit -Config $cfg -EmailConfig $emailCfg -Recipients $recipients -CcRecipients @() -Subject $Subject -Body $Body -BodyHtml $BodyHtml -Attachment $Attachment
 			return
 		}
 	}
 
-	throw 'No EmailSender provided and Email.Provider is not set to mailkit. MailKit is REQUIRED - configure Config\config.conf (Email.Provider=mailkit + SMTP + MailKit DLL paths), or pass -EmailSender to Start-AlertNotificationCycle.'
+	throw 'No EmailSender provided and Email.Provider is not set to mailkit. Configure Config\config.conf (Email.Provider=mailkit + SMTP + MailKit DLL paths), or pass -EmailSender to Start-AlertNotificationCycle.'
+}
+
+function Send-EmailViaNotifierConfig {
+	param(
+		[Parameter(Mandatory = $true)][object]$Notifier,
+		[Parameter(Mandatory = $true)][string[]]$Recipients,
+		[string[]]$CcRecipients,
+		[Parameter(Mandatory = $true)][string]$Subject,
+		[Parameter(Mandatory = $true)][string]$Body,
+		[string]$BodyHtml,
+		[string]$Attachment,
+		[string]$EmailProfile
+	)
+
+	if (-not $Recipients -or $Recipients.Count -eq 0) {
+		throw 'No recipients provided for Send-EmailViaNotifierConfig.'
+	}
+
+	$emailSender = $Notifier.EmailSender
+	if ($emailSender) {
+		& $emailSender $Recipients $Subject $Body $Attachment
+		return
+	}
+
+	$cfg = $null
+	try { $cfg = Get-NotificationToolConfig } catch { $cfg = $null }
+	if (-not $cfg) {
+		throw 'Notification tool config did not load.'
+	}
+
+	$profileName = $EmailProfile
+	if ([string]::IsNullOrWhiteSpace($profileName)) {
+		$profileName = $Notifier.Registration.EmailProfile
+	}
+	if ([string]::IsNullOrWhiteSpace($profileName)) {
+		$profileName = $cfg.DefaultEmailProfile
+	}
+	if ([string]::IsNullOrWhiteSpace($profileName)) { $profileName = 'default' }
+
+	$emailCfg = $cfg.Email
+	try {
+		if ($cfg.EmailProfiles -and $cfg.EmailProfiles.ContainsKey($profileName)) {
+			$emailCfg = $cfg.EmailProfiles[$profileName]
+		}
+	}
+	catch { }
+
+	if ($emailCfg -and $emailCfg.Provider -and ($emailCfg.Provider.ToString().ToLowerInvariant() -eq 'mailkit')) {
+		Send-EmailMailKit -Config $cfg -EmailConfig $emailCfg -Recipients $Recipients -CcRecipients $CcRecipients -Subject $Subject -Body $Body -BodyHtml $BodyHtml -Attachment $Attachment
+		return
+	}
+
+	throw 'No EmailSender provided and Email.Provider is not set to mailkit.'
+}
+
+function Convert-NotificationToolTextToHtmlFragment {
+	param([string]$Text)
+	try {
+		if ($null -eq $Text) { return '' }
+		$enc = [System.Net.WebUtility]::HtmlEncode($Text)
+		# Preserve line breaks.
+		return ($enc -replace "\r\n", "<br/>" -replace "\n", "<br/>")
+	}
+	catch {
+		return ''
+	}
+}
+
+function Get-NotificationTimeCategory {
+	param(
+		[Parameter(Mandatory = $true)][object]$Policy,
+		[Parameter(Mandatory = $true)][datetime]$LocalNow
+	)
+
+	try {
+		$day = $LocalNow.DayOfWeek.ToString()
+		$isWeekend = ($day -eq 'Saturday' -or $day -eq 'Sunday')
+		if ($isWeekend) { return 'weekend' }
+
+		if ($Policy.WorkingHours -and $Policy.WorkingHours.Enabled) {
+			$days = @($Policy.WorkingHours.DaysOfWeek)
+			$start = Convert-ToTimeSpan -Time $Policy.WorkingHours.Start
+			$end = Convert-ToTimeSpan -Time $Policy.WorkingHours.End
+			$inDay = ($days -contains $day)
+			if ($inDay -and (Test-InWindow -LocalNow $LocalNow -Start $start -End $end)) {
+				return 'working-hours'
+			}
+		}
+		return 'off-hours'
+	}
+	catch {
+		return 'off-hours'
+	}
+}
+
+function Get-NotificationToolPerAlertRepeatMinutes {
+	param([object]$Policy)
+	$perAlertMin = 120
+	try { if ($Policy.Throttle -and $Policy.Throttle.PerAlertMinMinutes) { $perAlertMin = [int]$Policy.Throttle.PerAlertMinMinutes } } catch { }
+	if ($perAlertMin -lt 1) { $perAlertMin = 1 }
+	return $perAlertMin
+}
+
+function Get-NotificationToolDigestRepeatMinutes {
+	param(
+		[object]$Policy,
+		[string]$TimeCategory
+	)
+	try {
+		if ($TimeCategory -eq 'weekend') {
+			if ($Policy.Weekends -and $Policy.Weekends.DigestMinMinutes) { return [int]$Policy.Weekends.DigestMinMinutes }
+			return 720
+		}
+		if ($Policy.OffHours -and $Policy.OffHours.DigestMinMinutes) { return [int]$Policy.OffHours.DigestMinMinutes }
+		return 240
+	}
+	catch {
+		return 240
+	}
+}
+
+function Ensure-NotificationToolAlertSentCount {
+	param(
+		[Parameter(Mandatory = $true)][object]$Alert,
+		[switch]$Increment
+	)
+	try {
+		if ($Alert.PSObject.Properties.Match('SentCount').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName SentCount -NotePropertyValue 0 -Force
+		}
+		if ($Increment) {
+			$Alert.SentCount = [int]$Alert.SentCount + 1
+		}
+	}
+	catch { }
+	return $Alert
+}
+
+function Normalize-NotificationToolEmailList {
+	param([object]$Values)
+	try {
+		if ($null -eq $Values) { return @() }
+		$vals = @($Values)
+		return @($vals | ForEach-Object { if ($_){ $_.ToString().Trim().ToLowerInvariant() } } | Where-Object { $_ } | Select-Object -Unique)
+	}
+	catch { return @() }
+}
+
+function Get-EscalationThresholds {
+	param([Parameter(Mandatory = $true)][object]$EscalationPolicy)
+	$thresholds = New-Object System.Collections.Generic.List[int]
+	try {
+		$map = $EscalationPolicy.EscalationTierEmails
+		if (-not $map) { return @() }
+		$keys = @()
+		if ($map -is [hashtable]) { $keys = @($map.Keys) }
+		elseif ($map.PSObject) { $keys = @($map.PSObject.Properties | ForEach-Object { $_.Name }) }
+		foreach ($k in $keys) {
+			if (-not $k) { continue }
+			$iv = $null
+			try { $iv = [int]$k } catch { $iv = $null }
+			if ($iv -and $iv -gt 0) { $thresholds.Add($iv) }
+		}
+	}
+	catch { }
+	return @($thresholds | Sort-Object -Unique)
+}
+
+function Get-EscalationTierRecipientsForThreshold {
+	param(
+		[Parameter(Mandatory = $true)][object]$EscalationPolicy,
+		[Parameter(Mandatory = $true)][int]$Threshold
+	)
+	try {
+		$map = $EscalationPolicy.EscalationTierEmails
+		if ($map) {
+			$key = $Threshold.ToString()
+			try {
+				if ($map -is [hashtable] -and $map.ContainsKey($key)) {
+					return @($map[$key])
+				}
+				if ($map.PSObject -and $map.PSObject.Properties.Match($key).Count -gt 0) {
+					return @($map.$key)
+				}
+			}
+			catch { }
+		}
+	}
+	catch { }
+	return @()
+}
+
+function Get-AlertLastEscalatedSentCount {
+	param([Parameter(Mandatory = $true)][object]$Alert)
+	try {
+		if ($Alert.PSObject.Properties.Match('LastEscalatedSentCount').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName LastEscalatedSentCount -NotePropertyValue 0 -Force
+		}
+		return [int]$Alert.LastEscalatedSentCount
+	}
+	catch { return 0 }
+}
+
+function Get-AlertEscalationNotifiedRecipients {
+	param([Parameter(Mandatory = $true)][object]$Alert)
+	try {
+		if ($Alert.PSObject.Properties.Match('EscalationNotifiedRecipients').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName EscalationNotifiedRecipients -NotePropertyValue @() -Force
+		}
+		return @($Alert.EscalationNotifiedRecipients)
+	}
+	catch { return @() }
+}
+
+function Set-AlertEscalationNotifiedRecipients {
+	param(
+		[Parameter(Mandatory = $true)][object]$Alert,
+		[Parameter(Mandatory = $true)][string[]]$Recipients
+	)
+	try {
+		if ($Alert.PSObject.Properties.Match('EscalationNotifiedRecipients').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName EscalationNotifiedRecipients -NotePropertyValue @() -Force
+		}
+		# Persist as a clean string[] (plain emails only).
+		$clean = @($Recipients | ForEach-Object { if ($_){ $_.ToString().Trim().ToLowerInvariant() } } | Where-Object { $_ } | Select-Object -Unique)
+		$Alert.EscalationNotifiedRecipients = @($clean)
+	}
+	catch { }
+	return $Alert
+}
+
+function Mark-AlertEscalated {
+	param(
+		[Parameter(Mandatory = $true)][object]$Alert,
+		[Parameter(Mandatory = $true)][datetime]$UtcNow,
+		[int]$SentCount
+	)
+	try {
+		if ($Alert.PSObject.Properties.Match('LastEscalatedUtc').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName LastEscalatedUtc -NotePropertyValue $null -Force
+		}
+		$Alert.LastEscalatedUtc = $UtcNow.ToString('o')
+		if ($Alert.PSObject.Properties.Match('LastEscalatedSentCount').Count -eq 0) {
+			$Alert | Add-Member -NotePropertyName LastEscalatedSentCount -NotePropertyValue 0 -Force
+		}
+		if ($SentCount -ge 0) {
+			$Alert.LastEscalatedSentCount = [int]$SentCount
+		}
+	}
+	catch { }
+	return $Alert
+}
+
+function Send-AlertEscalationEmail {
+	param(
+		[Parameter(Mandatory = $true)][object]$Notifier,
+		[Parameter(Mandatory = $true)][string]$Key,
+		[Parameter(Mandatory = $true)][object]$Alert,
+		[Parameter(Mandatory = $true)][object]$EscalationPolicy,
+		[Parameter(Mandatory = $true)][string]$Reason,
+		[Parameter(Mandatory = $true)][int]$Threshold
+	)
+
+	$originalRecipients = @()
+	try { if ($Notifier.Registration -and $Notifier.Registration.Recipients) { $originalRecipients = @($Notifier.Registration.Recipients) } } catch { }
+	$prior = Normalize-NotificationToolEmailList -Values $originalRecipients
+	$priorEsc = Normalize-NotificationToolEmailList -Values (Get-AlertEscalationNotifiedRecipients -Alert $Alert)
+	# Build CC list explicitly (flatten -> filter -> unique) to avoid accidentally passing a single concatenated string.
+	$prior = @($prior + $priorEsc)
+	$prior = @($prior | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+	$tierRecipients = Get-EscalationTierRecipientsForThreshold -EscalationPolicy $EscalationPolicy -Threshold $Threshold
+
+	$tierNorm = Normalize-NotificationToolEmailList -Values $tierRecipients
+	if (-not $tierNorm -or $tierNorm.Count -eq 0) {
+		Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Escalation skipped for '$Key': no tier recipients configured." -VerboseOnly
+		return $false
+	}
+
+	# To = new recipients only; Cc = everyone previously notified.
+	$to = @($tierNorm | Where-Object { $prior -notcontains $_ })
+	$cc = @($prior)
+	if (-not $to -or $to.Count -eq 0) {
+		Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Escalation skipped for '$Key': no NEW recipients to notify at tier $Threshold." -VerboseOnly
+		return $false
+	}
+
+	$prefix = $EscalationPolicy.SubjectPrefix
+	if ([string]::IsNullOrWhiteSpace($prefix)) {
+		$prefix = "[$($Notifier.Registration.ScriptId)][ESCALATION]"
+	}
+
+	$sentCount = 0
+	try { if ($Alert.PSObject.Properties.Match('SentCount').Count -gt 0) { $sentCount = [int]$Alert.SentCount } } catch { $sentCount = 0 }
+
+	$originalRecipientsText = ''
+	try { $originalRecipientsText = (@($originalRecipients | ForEach-Object { if ($_){ $_.ToString().Trim() } } | Where-Object { $_ }) -join ', ') } catch { $originalRecipientsText = '' }
+	$ccText = ''
+	try { $ccText = (@($cc) -join ', ') } catch { $ccText = '' }
+	$toText = ''
+	try { $toText = (@($to) -join ', ') } catch { $toText = '' }
+
+	$subject = "$prefix $($Alert.LastSubject)"
+	$tierNote = ''
+	try {
+		$tnMap = $EscalationPolicy.EscalationTierNotes
+		$keyStr = $Threshold.ToString()
+		if ($tnMap -is [hashtable] -and $tnMap.ContainsKey($keyStr)) { $tierNote = [string]$tnMap[$keyStr] }
+		elseif ($tnMap -and $tnMap.PSObject -and $tnMap.PSObject.Properties.Match($keyStr).Count -gt 0) { $tierNote = [string]$tnMap.$keyStr }
+	}
+	catch { $tierNote = '' }
+	if ($tierNote) { $tierNote = $tierNote.Trim() }
+
+	$main = "ALERT KEY: $Key`r`nSTATUS: $($Alert.Status)`r`nREASON: $Reason`r`nTHRESHOLD: $Threshold`r`nSENT COUNT: $sentCount`r`nORIGINAL RECIPIENTS: $originalRecipientsText`r`nTO (NEW): $toText`r`nCC (PREVIOUSLY NOTIFIED): $ccText`r`nFIRST SEEN (UTC): $($Alert.FirstSeenUtc)`r`nLAST SEEN (UTC): $($Alert.LastSeenUtc)`r`n`r`nLAST BODY:`r`n$($Alert.LastBody)"
+	$bodies = Add-NotificationToolFooterToBodies -BaseBodyText $main -FooterText ('Escalation notification. Please investigate promptly.') -TopBoxTitle 'Tier note' -TopBoxText $tierNote
+
+	$emailProfile = $EscalationPolicy.EmailProfile
+	if ([string]::IsNullOrWhiteSpace($emailProfile)) {
+		try { $emailProfile = (Get-NotificationToolConfig).DefaultEscalationEmailProfile } catch { }
+	}
+
+	Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Escalation send for '$Key': tier=$Threshold; to=$toText; cc=$ccText" -VerboseOnly
+	try {
+		Send-EmailViaNotifierConfig -Notifier $Notifier -Recipients $to -CcRecipients $cc -Subject $subject -Body $bodies.Text -BodyHtml $bodies.Html -Attachment $null -EmailProfile $emailProfile
+	}
+	catch {
+		$em = ''
+		try { $em = $_.Exception.Message } catch { $em = 'Unknown error' }
+		Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Escalation send FAILED for '$Key' (tier $Threshold). To=$toText; Cc=$ccText; Error=$em"
+		return $false
+	}
+
+	# Record notified recipients so later tiers can CC them.
+	$allNotified = @($prior + $to | Select-Object -Unique)
+	$Alert = Set-AlertEscalationNotifiedRecipients -Alert $Alert -Recipients $allNotified
+	return $true
+}
+
+function New-NotificationToolHumanFooterText {
+	param(
+		[Parameter(Mandatory = $true)][object]$Notifier,
+		[string]$AlertKey,
+		[string]$SendKind, # first|follow-up|digest|digest-back-in-hours
+		[datetime]$SinceUtc,
+		[object]$Alert
+	)
+
+	$policy = $Notifier.Policy
+	$cat = Get-NotificationTimeCategory -Policy $policy -LocalNow $Notifier.LocalNow
+	$perAlertMin = Get-NotificationToolPerAlertRepeatMinutes -Policy $policy
+	$digestMin = Get-NotificationToolDigestRepeatMinutes -Policy $policy -TimeCategory $cat
+
+	$when = switch ($cat) {
+		'weekend' { 'over the weekend' }
+		'working-hours' { 'during working hours' }
+		default { 'outside working hours' }
+	}
+
+	$repeat = ''
+	if ($cat -eq 'working-hours') {
+		$repeat = "If not resolved, this alert will repeat about every $perAlertMin minute(s) during working hours."
+	}
+	else {
+		$repeat = "If not resolved, you can expect digest updates about every $digestMin minute(s) while $when."
+	}
+
+	$prefix = 'Why you''re receiving this: '
+	if ($SendKind -eq 'first') {
+		return ($prefix + "First alert sent $when. " + $repeat)
+	}
+	elseif ($SendKind -eq 'follow-up') {
+		$nextSentNum = $null
+		try {
+			if ($Alert -and ($Alert.PSObject.Properties.Match('SentCount').Count -gt 0)) {
+				$nextSentNum = ([int]$Alert.SentCount + 1)
+			}
+		}
+		catch { $nextSentNum = $null }
+		if ($nextSentNum -and $nextSentNum -ge 2) {
+			return ($prefix + "Repeat alert (#$nextSentNum) sent $when. " + $repeat)
+		}
+		return ($prefix + "Repeat alert sent $when. " + $repeat)
+	}
+	elseif ($SendKind -eq 'digest-back-in-hours') {
+		$sinceText = ''
+		try { if ($SinceUtc) { $sinceText = $SinceUtc.ToString('o') } } catch { }
+		if ($sinceText) {
+			return ($prefix + "Digest summary sent during working hours covering activity since $sinceText (UTC).")
+		}
+		return ($prefix + 'Digest summary sent during working hours covering earlier off-hours activity.')
+	}
+	else {
+		$sinceText = ''
+		try { if ($SinceUtc) { $sinceText = $SinceUtc.ToString('o') } } catch { }
+		if ($sinceText) {
+			return ($prefix + "Digest update sent $when covering activity since $sinceText (UTC). " + $repeat)
+		}
+		return ($prefix + "Digest update sent $when. " + $repeat)
+	}
+}
+
+function Add-NotificationToolFooterToBodies {
+	param(
+		[Parameter(Mandatory = $true)][string]$BaseBodyText,
+		[Parameter(Mandatory = $true)][string]$FooterText,
+		[string]$TopBoxTitle,
+		[string]$TopBoxText
+	)
+
+	$sep = "`r`n`r`n----`r`n"
+	$bodyText = $BaseBodyText
+	if ([string]::IsNullOrWhiteSpace($bodyText)) { $bodyText = '' }
+	if (-not [string]::IsNullOrWhiteSpace($TopBoxText)) {
+		$tt = $TopBoxText.Trim()
+		if ($tt) {
+			$hdr = $TopBoxTitle
+			if ([string]::IsNullOrWhiteSpace($hdr)) { $hdr = 'Tier note' }
+			$bodyText = ($hdr.ToUpperInvariant() + ': ' + $tt + "`r`n`r`n" + $bodyText)
+		}
+	}
+	if (-not [string]::IsNullOrWhiteSpace($FooterText)) {
+		$bodyText = $bodyText + $sep + $FooterText + "`r`n"
+	}
+
+	# Build a modern HTML rendering (still safe-encoded).
+	$mainFrag = Convert-NotificationToolTextToHtmlFragment -Text $BaseBodyText
+	$footerFrag = Convert-NotificationToolTextToHtmlFragment -Text $FooterText
+	$topFrag = Convert-NotificationToolTextToHtmlFragment -Text $TopBoxText
+	$topTitleFrag = Convert-NotificationToolTextToHtmlFragment -Text $TopBoxTitle
+
+	# Colors are intentionally subtle and widely supported in email clients.
+	$mainStyle = 'background:#f3f4f6;border:1px solid #e5e7eb;border-left:4px solid #ef4444;border-radius:10px;padding:12px 14px;color:#b91c1c;'
+	$noteWrapStyle = 'margin-top:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;color:#374151;'
+	$noteTitleStyle = 'font-weight:600;margin-bottom:6px;'
+	$noteBodyStyle = 'font-size:12.5px;'
+	$topWrapStyle = 'margin-bottom:12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;color:#374151;'
+
+	$bodyHtml = '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.4">'
+	if (-not [string]::IsNullOrWhiteSpace($TopBoxText)) {
+		$title = $topTitleFrag
+		if ([string]::IsNullOrWhiteSpace($title)) { $title = 'Tier note' }
+		$bodyHtml = $bodyHtml +
+			('<div style="' + $topWrapStyle + '">') +
+			('<div style="' + $noteTitleStyle + '">' + $title + '</div>') +
+			('<div style="' + $noteBodyStyle + '">' + $topFrag + '</div>') +
+			'</div>'
+	}
+	$bodyHtml = $bodyHtml + ('<div style="' + $mainStyle + '">' + $mainFrag + '</div>')
+
+	if (-not [string]::IsNullOrWhiteSpace($FooterText)) {
+		$bodyHtml = $bodyHtml +
+			('<div style="' + $noteWrapStyle + '">') +
+			('<div style="' + $noteTitleStyle + '">Note</div>') +
+			('<div style="' + $noteBodyStyle + '">' + $footerFrag + '</div>') +
+			'</div>'
+	}
+
+	$bodyHtml = $bodyHtml + '</div>'
+	return [pscustomobject]@{ Text = $bodyText; Html = $bodyHtml }
 }
 
 function Resolve-NotificationToolAttachmentPath {
@@ -1350,9 +1981,12 @@ function Complete-AlertNotificationCycle {
 	$utcNow = $Notifier.UtcNow
 	$mode = Get-NotificationMode -Policy $policy -LocalNow $Notifier.LocalNow
 	$pendingDigestAtStart = $state.PendingDigestSinceUtc
+	$lastMode = $null
+	try { if ($state.LastMode) { $lastMode = $state.LastMode } } catch { $lastMode = $null }
 
 	Resolve-UnobservedAlerts -Notifier $Notifier -CurrentMode $mode.Mode
 	$state.LastRunUtc = $utcNow.ToString('o')
+	try { $state.LastMode = $mode.Mode } catch { try { $state | Add-Member -NotePropertyName LastMode -NotePropertyValue $mode.Mode -Force } catch { } }
 
 	$activeCount = @($state.Alerts.Values | Where-Object { $_.Status -eq 'Active' }).Count
 	Invoke-ManualResetIfFlagDeleted -Notifier $Notifier -ActiveCount $activeCount
@@ -1409,8 +2043,12 @@ function Complete-AlertNotificationCycle {
 						Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Using attachment for '$key': $attachment" -VerboseOnly
 					}
 				}
-				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $run.Body -Attachment $attachment
+				Ensure-NotificationToolAlertSentCount -Alert $alert | Out-Null
+				$footer = New-NotificationToolHumanFooterText -Notifier $Notifier -AlertKey $key -SendKind 'first' -Alert $alert
+				$bodies = Add-NotificationToolFooterToBodies -BaseBodyText $run.Body -FooterText $footer
+				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $bodies.Text -BodyHtml $bodies.Html -Attachment $attachment
 				$alert.LastSentUtc = $utcNow.ToString('o')
+				Ensure-NotificationToolAlertSentCount -Alert $alert -Increment | Out-Null
 				$state.Alerts[$key] = $alert
 			}
 			catch {
@@ -1465,9 +2103,47 @@ function Complete-AlertNotificationCycle {
 						Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Using attachment for '$key': $attachment" -VerboseOnly
 					}
 				}
-				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $run.Body -Attachment $attachment
+				Ensure-NotificationToolAlertSentCount -Alert $alert | Out-Null
+				$footer = New-NotificationToolHumanFooterText -Notifier $Notifier -AlertKey $key -SendKind 'follow-up' -Alert $alert
+				$bodies = Add-NotificationToolFooterToBodies -BaseBodyText $run.Body -FooterText $footer
+				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $bodies.Text -BodyHtml $bodies.Html -Attachment $attachment
 				$alert.LastSentUtc = $utcNow.ToString('o')
+				Ensure-NotificationToolAlertSentCount -Alert $alert -Increment | Out-Null
 				$state.Alerts[$key] = $alert
+
+				# Escalation: tier thresholds based on SentCount
+				try {
+					$escPol = Get-AlertEscalationPolicy -EscalationPolicyPath $Notifier.Registration.EscalationPolicyPath -ScriptId $Notifier.Registration.ScriptId
+					if ($escPol -and $escPol.Enabled) {
+						$thresholds = @(Get-EscalationThresholds -EscalationPolicy $escPol)
+						if ($thresholds -and $thresholds.Count -gt 0) {
+							$lastEscAt = Get-AlertLastEscalatedSentCount -Alert $alert
+							$sentNow = 0
+							try { $sentNow = [int]$alert.SentCount } catch { $sentNow = 0 }
+							foreach ($t in $thresholds) {
+								if ($t -le 0) { continue }
+								if ($t -le $lastEscAt) { continue }
+								if ($sentNow -lt $t) { continue }
+								$didSend = $false
+								try {
+									$didSend = [bool](Send-AlertEscalationEmail -Notifier $Notifier -Key $key -Alert $alert -EscalationPolicy $escPol -Reason 'SentCountTierThresholdReached' -Threshold $t)
+								}
+								catch {
+									$em = ''
+									try { $em = $_.Exception.Message } catch { $em = 'Unknown error' }
+									Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Escalation threw for '$key' (tier $t). Error=$em"
+									$didSend = $false
+								}
+								if ($didSend) {
+									$alert = Mark-AlertEscalated -Alert $alert -UtcNow $utcNow -SentCount $t
+									$lastEscAt = $t
+									$state.Alerts[$key] = $alert
+								}
+							}
+						}
+					}
+				}
+				catch { }
 			}
 			catch {
 				Write-NotificationToolDiagnostic -Notifier $Notifier -Message "Send failed for '$key' (follow-up): $($_.Exception.Message)"
@@ -1498,7 +2174,9 @@ function Complete-AlertNotificationCycle {
 				$sinceUtc = Convert-ToUtcDateTime -Text $pendingDigestAtStart
 				$subj = "$prefix Alert digest (back in hours)"
 				$body = Build-DigestBody -Notifier $Notifier -SinceUtc $sinceUtc
-				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $body -Attachment $null
+				$footer = New-NotificationToolHumanFooterText -Notifier $Notifier -SendKind 'digest-back-in-hours' -SinceUtc $sinceUtc
+				$bodies = Add-NotificationToolFooterToBodies -BaseBodyText $body -FooterText $footer
+				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $bodies.Text -BodyHtml $bodies.Html -Attachment $null
 				$state.LastDigestSentUtc = $utcNow.ToString('o')
 				$state.PendingDigestSinceUtc = $null
 			}
@@ -1556,7 +2234,9 @@ function Complete-AlertNotificationCycle {
 				$activeCount2 = @($state.Alerts.Values | Where-Object { $_.Status -eq 'Active' }).Count
 				$subj = "$prefix Alert digest (active=$activeCount2)"
 				$body = Build-DigestBody -Notifier $Notifier -SinceUtc $sinceUtc
-				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $body -Attachment $null
+				$footer = New-NotificationToolHumanFooterText -Notifier $Notifier -SendKind 'digest' -SinceUtc $sinceUtc
+				$bodies = Add-NotificationToolFooterToBodies -BaseBodyText $body -FooterText $footer
+				Send-NotifierEmail -Notifier $Notifier -Subject $subj -Body $bodies.Text -BodyHtml $bodies.Html -Attachment $null
 				$state.LastDigestSentUtc = $utcNow.ToString('o')
 				$state.PendingDigestSinceUtc = $null
 			}
@@ -1590,6 +2270,7 @@ if (-not $env:NOTIFICATION_TOOL_DISABLE_AUTO_REGISTER) {
 				$reg0 = Get-OrCreateRegistration -ScriptPath $callerPath
 				$null = Get-AlertNotificationPolicy -PolicyPath $reg0.PolicyPath
 				$null = Get-AlertNotificationState -StatePath $reg0.StatePath
+				try { $null = Get-AlertEscalationPolicy -EscalationPolicyPath $reg0.EscalationPolicyPath -ScriptId $reg0.ScriptId } catch { }
 			}
 		}
 	}
